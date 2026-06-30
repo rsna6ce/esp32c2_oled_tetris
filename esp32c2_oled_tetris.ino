@@ -5,8 +5,9 @@
 #define PIN_LEFT    4
 #define PIN_RIGHT   7
 #define PIN_ROTATE 10
-#define PIN_BOOT    9     // 基板上のBOOTボタン(GPIO9)
+#define PIN_BOOT    9     // 基板上のBOOTボタン(GPIO9) / ゲーム中は下ボタン(ソフトドロップ)に
 #define PIN_DRAIN   3     // 仮想GND
+#define PIN_LED     8     // オンボードLED
 
 // ================== U8g2 (40x72 縦長モード) ==================
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R1, U8X8_PIN_NONE, /*SCL*/6, /*SDA*/5);
@@ -221,9 +222,9 @@ const uint8_t tetrominoes[7][4][4][4] = {
     }
   }
 };
+
 // NEXTを描画するオフセット
 const int32_t next_offset_y[7] = {/*I*/0,/*O*/1, /*T*/1, /*J*/1, /*L*/1,/*S*/0, /*Z*/0};
-
 
 int board[BOARD_H][BOARD_W] = {0};
 
@@ -233,6 +234,7 @@ int score = 0, level = 0;
 unsigned long dropTimer = 0;
 unsigned long dropInterval = 500;
 bool gameOver = false, started = false;
+bool isClearingLines = false;                 // ★新規追加：ライン消去演出中フラグ
 
 // 前方宣言
 void showLogo();
@@ -257,6 +259,9 @@ void setup() {
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_DRAIN, OUTPUT_OPEN_DRAIN);
   digitalWrite(PIN_DRAIN, LOW);
+  
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);
 
   u8g2.begin();
   u8g2.setBusClock(400000);
@@ -276,7 +281,11 @@ void loop() {
   if (gameOver) { drawGameOver(); return; }
 
   handleInput();
-  if (millis() - dropTimer > dropInterval) {
+
+  bool down = (digitalRead(PIN_LEFT) == LOW && digitalRead(PIN_RIGHT) == LOW) || (digitalRead(PIN_BOOT) == LOW);
+  unsigned long currentInterval = down ? 40 : dropInterval;
+
+  if (millis() - dropTimer > currentInterval) {
     dropTimer = millis();
     if (!moveDown()) lockPiece();
   }
@@ -347,14 +356,58 @@ void lockPiece() {
 }
 
 void clearLines() {
+  bool lineFull[BOARD_H] = {false};
   int lines = 0;
+
+  for (int y = 0; y < BOARD_H; y++) {
+    bool full = true;
+    for (int x = 0; x < BOARD_W; x++) {
+      if (!board[y][x]) { full = false; break; }
+    }
+    if (full) {
+      lineFull[y] = true;
+      lines++;
+    }
+  }
+
+  if (lines == 0) return;
+
+  // 点滅演出の開始フラグを立てる（これで落下中ミノの上書き描画をストップ）
+  isClearingLines = true; 
+
+  int tempBoard[BOARD_H][BOARD_W];
+  memcpy(tempBoard, board, sizeof(board));
+
+  for (int i = 0; i < 3; i++) {
+    // 【消灯】
+    for (int y = 0; y < BOARD_H; y++) {
+      if (lineFull[y]) {
+        for (int x = 0; x < BOARD_W; x++) board[y][x] = 0;
+      }
+    }
+    digitalWrite(PIN_LED, HIGH); 
+    drawAll();
+    u8g2.sendBuffer();
+    delay(100);                  
+
+    // 【点灯】
+    memcpy(board, tempBoard, sizeof(board));
+    digitalWrite(PIN_LED, LOW);  
+    drawAll();
+    u8g2.sendBuffer();
+    delay(100);                  
+  }
+  
+  digitalWrite(PIN_LED, HIGH);   
+  isClearingLines = false;       // 演出終了、フラグを戻す
+
+  // 実際の消去処理
   for (int y = BOARD_H-1; y >= 0; y--) {
     bool full = true;
     for (int x = 0; x < BOARD_W; x++) {
       if (!board[y][x]) { full = false; break; }
     }
     if (full) {
-      lines++;
       for (int yy = y; yy > 0; yy--) {
         for (int x = 0; x < BOARD_W; x++) board[yy][x] = board[yy-1][x];
       }
@@ -362,11 +415,11 @@ void clearLines() {
       y++;
     }
   }
+
   if (lines) {
     score += lines;
     if (score / 10 > level) {
       level = score / 10;
-      // 型エラー回避のため、100UL を 100 に変更しました
       dropInterval = max(100, 500 - level * 30);
     }
   }
@@ -409,6 +462,8 @@ void drawBoard() {
 }
 
 void drawCurrentPiece() {
+  if (isClearingLines) return; // ★演出中は動いているミノの重複描画をスキップ
+
   for (int y = 0; y < 4; y++) {
     for (int x = 0; x < 4; x++) {
       if (tetrominoes[currentPiece][rotation][y][x]) {
